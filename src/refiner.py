@@ -11,12 +11,18 @@ from openai import OpenAI
 from tqdm import tqdm
 from pydantic import BaseModel
 import asyncio
+from jinja2 import Environment, FileSystemLoader
+import logging
 
+logger = logging.getLogger("refiner")
 client = OpenAI()
 
+jinja_env = Environment(loader=FileSystemLoader("../prompts"))
+
+
 class SyntheticInputData(BaseModel):
-    analysis: str
     synthetic_inputs: List[str]
+
 
 class EvalResult(BaseModel):
     output_analysis: str
@@ -26,17 +32,16 @@ class EvalResult(BaseModel):
     efficiency: int
     creativity: int
 
-with open('../prompts/generate.txt') as f:
+
+with open("../prompts/generate.txt") as f:
     GENERATE_PROMPT = f.read().strip()
 
-with open('../prompts/edit.txt') as f:
+with open("../prompts/edit.txt") as f:
     EDIT_PROMPT = f.read().strip()
 
-with open('../prompts/gen user prompt.txt') as f:
-    GENERATE_USER_PROMPT = f.read().strip()
-
-with open('../prompts/evaluate.txt') as f:
+with open("../prompts/evaluate.txt") as f:
     EVALUATE_PROMPT = f.read().strip()
+
 
 def generate_prompt(task_or_prompt: str, temp=1):
     completion = client.chat.completions.create(
@@ -52,13 +57,13 @@ def generate_prompt(task_or_prompt: str, temp=1):
             },
         ],
         temperature=temp,
-        max_tokens=5000
+        max_tokens=5000,
     )
 
     return completion.choices[0].message.content
 
 
-def edit_prompt(prompt: str, edit_statement:str):
+def edit_prompt(prompt: str, edit_statement: str):
     completion = client.chat.completions.create(
         model="gpt-4o-mini",
         messages=[
@@ -68,56 +73,82 @@ def edit_prompt(prompt: str, edit_statement:str):
             },
             {
                 "role": "user",
-                "content": f"Task, goal, or updates to make: \"{edit_statement}\"\n\n# Prompt:\n{prompt}\n\n---\n\nProvide an updated prompt to complete the task effectively.",
+                "content": f'Task, goal, or updates to make: "{edit_statement}"\n\n# Prompt:\n{prompt}\n\n---\n\nProvide an updated prompt to complete the task effectively.',
             },
         ],
         temperature=1,
-        max_tokens=5000
+        max_tokens=5000,
     )
 
     return completion.choices[0].message.content
 
 
-def get_user_prompts(system_prompt: str) -> List[str]:
-    completion = client.beta.chat.completions.parse(
-        model="gpt-4o-mini",
+def needs_input(prompt_to_analyze: str):
+    template = jinja_env.get_template("needs_inputs_clf.jinja")
+    prompt = template.render(prompt=prompt_to_analyze)
+    completion = client.chat.completions.create(
+        model="o3-mini",
         messages=[
             {
                 "role": "system",
-                "content": GENERATE_USER_PROMPT,
-            },
-            {
-                "role": "user",
-                "content": f"Generate synthetic input data for this prompt:\n\n<prompt>\n{system_prompt}\n</prompt>"
+                "content": prompt,
             },
         ],
-        temperature=1,
+    )
+
+    data = completion.choices[0].message.content
+    if data:
+        if "TRUE" in data:
+            return True
+        elif "FALSE" in data:
+            return False
+        elif "true" in data.lower():
+            return True
+        elif "false" in data.lower():
+            return False
+        logger.error("Meta-input classification: true or false not in text")
+    logger.error("Meta-input classification: failed")
+    return True
+
+
+def get_user_prompts(system_prompt: str, num: int) -> List[str]:
+    template = jinja_env.get_template("synthetic_data.jinja")
+    prompt = template.render(prompt=system_prompt, num=num, complexity="Standard")
+
+    completion = client.beta.chat.completions.parse(
+        model="gpt-4o",
+        messages=[
+            {
+                "role": "system",
+                "content": prompt,
+            },
+        ],
+        temperature=0.3,
         max_tokens=5000,
-        response_format=SyntheticInputData
+        response_format=SyntheticInputData,
     )
 
     data = completion.choices[0].message.parsed
-    
+
     if data:
+        num_gen = len(data.synthetic_inputs)
+        if num_gen != num:
+            logger.warning(f"{num} inputs requested but {num_gen} generated.")
         return data.synthetic_inputs
     return []
-    
 
-def test_prompt(system_prompt: str, user_prompt: str, args: dict):        
-    completion = client.chat.completions.create(
-        messages=[
-            {
-                "role": "system",
-                "content": system_prompt,
-            },
-            {
-                "role": "user",
-                "content": user_prompt
-            },
-        ],
-        **args
-    )
 
+def test_prompt(system_prompt: str, user_prompt: str|None, args: dict):
+    messages = [
+        {
+            "role": "system",
+            "content": system_prompt,
+        }
+    ]
+    if user_prompt:
+        # not all prompts need user input data
+        messages.append({"role": "user", "content": user_prompt})
+    completion = client.chat.completions.create(messages=messages, **args)
     return completion.choices[0].message.content
 
 
@@ -138,40 +169,44 @@ def evaluate_completion(system_prompt: str, user_prompt: str, output: str):
 {output}
 """.strip()
     completion = client.beta.chat.completions.parse(
-        model="gpt-4o-mini",
+        model="o3-mini",
         messages=[
             {"role": "system", "content": EVALUATE_PROMPT},
-            {"role": "user", "content": eval_context}
+            {"role": "user", "content": eval_context},
         ],
-        temperature=0,  # Deterministic evaluation
-        max_tokens=5000,
-        response_format=EvalResult
+        # temperature=0,  # Deterministic evaluation
+        # max_tokens=5000,
+        response_format=EvalResult,
     )
-    
+
     result = completion.choices[0].message.parsed
     if not result:
         raise ValueError("No evaluation result received")
-        
+
     return result
 
-async def run_parallel(
-        items: List[Any], task_func: Callable[..., T], *args
-    ) -> List[T]:
-        """Run tasks in parallel using asyncio"""
-        async def wrapped_task(item):
-            return await asyncio.to_thread(task_func, item, *args)
 
-        return await asyncio.gather(*(wrapped_task(item) for item in items))
+async def run_parallel(items: List[Any], task_func: Callable[..., T], *args) -> List[T]:
+    """Run tasks in parallel using asyncio"""
+
+    async def wrapped_task(item):
+        return await asyncio.to_thread(task_func, item, *args)
+
+    return await asyncio.gather(*(wrapped_task(item) for item in items))
+
 
 def main():
     print("Enter your prompt. Type ctrl+d and enter to submit")
     lines = sys.stdin.readlines()
     sys.stdin.close()
-    print('submitted')
-    prompt = '\n'.join(lines)
+    prompt = "\n".join(lines)
 
-    synthetic_input = get_user_prompts(prompt)
-    print(synthetic_input)
+    if needs_input(prompt):
+        logger.info("Generating synthetic inputs...")
+        synthetic_input = get_user_prompts(prompt, 5)
+    else:
+        synthetic_input = [None]
+    logger.info(synthetic_input)
 
     runtime_args = {
         "model": "gpt-4o-mini",
@@ -180,58 +215,64 @@ def main():
     }
 
     # get K options
-    temps = [0,0.3,0.6]
+    temps = [0, 0.3, 0.6]
     drafts = []
     with ThreadPoolExecutor(max_workers=len(temps)) as executor:
         futures = [executor.submit(generate_prompt, prompt, temp) for temp in temps]
-        for future in tqdm(as_completed(futures), total=len(temps)):
+        for future in tqdm(as_completed(futures), total=len(temps), desc="Drafting"):
             drafts.append(future.result())
 
-    pbar = tqdm('Progress', total=len(drafts)*len(synthetic_input)*2)
+    pbar = tqdm(desc="Evals", total=len(drafts) * len(synthetic_input) * 2)
     prompt_results = []
     for draft in drafts:
-        prompt_data = {'prompt': draft, 'tests': []}
-        for i, test_data in enumerate(synthetic_input): # could parallelize
+        prompt_data = {"prompt": draft, "tests": []}
+        for i, test_data in enumerate(synthetic_input):  # could parallelize
             output = test_prompt(draft, test_data, runtime_args)
             pbar.update()
             if output is None:
                 print(f"Warning: No output received for test {i}")
-                prompt_data['tests'].append({
-                    'input': test_data,
-                    'input_idx': i,
-                    'output': None,
-                    'evaluation': None
-                })
+                prompt_data["tests"].append(
+                    {
+                        "input": test_data,
+                        "input_idx": i,
+                        "output": None,
+                        "evaluation": None,
+                    }
+                )
                 continue
-            
+
             # Evaluate the completion
             try:
-                eval_result = evaluate_completion(draft, test_data, output)
+                eval_result = evaluate_completion(draft, str(test_data), output)
                 pbar.update()
-                prompt_data['tests'].append({
-                    'input': test_data,
-                    'input_idx': i,
-                    'output': output,
-                    'evaluation': eval_result.model_dump()
-                })
+                prompt_data["tests"].append(
+                    {
+                        "input": test_data,
+                        "input_idx": i,
+                        "output": output,
+                        "evaluation": eval_result.model_dump(),
+                    }
+                )
             except ValueError as e:
                 print(f"Warning: Evaluation failed for test {i}: {str(e)}")
-                prompt_data['tests'].append({
-                    'input': test_data,
-                    'input_idx': i,
-                    'output': output,
-                    'evaluation': None
-                })
-            prompt_results.append(prompt_data)
+                prompt_data["tests"].append(
+                    {
+                        "input": test_data,
+                        "input_idx": i,
+                        "output": output,
+                        "evaluation": None,
+                    }
+                )
+        prompt_results.append(prompt_data)
     pbar.close()
 
-    os.makedirs('../cache/', exist_ok=True)
+    os.makedirs("../cache/", exist_ok=True)
     timestamp = datetime.datetime.now().strftime("prompts_%d%m%Y_%H%M%S")
-    filename = f'../cache/draft_{timestamp}.json'
-    with open(filename,'w') as f:
-        f.write(json.dumps(prompt_results,indent=2))
-    print(f'Saved prompts to {filename}')
+    filename = f"../cache/draft_{timestamp}.json"
+    with open(filename, "w") as f:
+        f.write(json.dumps(prompt_results, indent=2))
+    print(f"Saved prompts to {filename}")
 
 
-if __name__=='__main__':
+if __name__ == "__main__":
     main()
