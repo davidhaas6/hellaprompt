@@ -6,6 +6,7 @@ import json
 import os
 import sys
 from typing import Any, Callable, List
+import uuid
 from annotated_types import T
 from openai import OpenAI
 from tqdm import tqdm
@@ -36,9 +37,6 @@ class EvalResult(BaseModel):
 with open("../prompts/generate.txt") as f:
     GENERATE_PROMPT = f.read().strip()
 
-with open("../prompts/edit.txt") as f:
-    EDIT_PROMPT = f.read().strip()
-
 with open("../prompts/evaluate.txt") as f:
     EVALUATE_PROMPT = f.read().strip()
 
@@ -57,26 +55,6 @@ def generate_prompt(task_or_prompt: str, temp=1):
             },
         ],
         temperature=temp,
-        max_tokens=5000,
-    )
-
-    return completion.choices[0].message.content
-
-
-def edit_prompt(prompt: str, edit_statement: str):
-    completion = client.chat.completions.create(
-        model="gpt-4o-mini",
-        messages=[
-            {
-                "role": "system",
-                "content": EDIT_PROMPT,
-            },
-            {
-                "role": "user",
-                "content": f'Task, goal, or updates to make: "{edit_statement}"\n\n# Prompt:\n{prompt}\n\n---\n\nProvide an updated prompt to complete the task effectively.',
-            },
-        ],
-        temperature=1,
         max_tokens=5000,
     )
 
@@ -138,7 +116,7 @@ def get_user_prompts(system_prompt: str, num: int) -> List[str]:
     return []
 
 
-def test_prompt(system_prompt: str, user_prompt: str|None, args: dict):
+def test_prompt(system_prompt: str, user_prompt: str | None, args: dict):
     messages = [
         {
             "role": "system",
@@ -154,45 +132,23 @@ def test_prompt(system_prompt: str, user_prompt: str|None, args: dict):
 
 def evaluate_completion(system_prompt: str, user_prompt: str, output: str):
     # Template the evaluation prompt with actual data
-    eval_context = f"""
-# System Prompt:
-```markdown
-{system_prompt}
-```
-
-# User Prompt: 
-```markdown
-{user_prompt}
-```
-
-# Output: 
-{output}
-""".strip()
+    template = jinja_env.get_template("evaluate_user.jinja")
+    eval_context = template.render(
+        system_prompt=system_prompt, user_prompt=user_prompt, output=output
+    )
     completion = client.beta.chat.completions.parse(
         model="o3-mini",
         messages=[
             {"role": "system", "content": EVALUATE_PROMPT},
             {"role": "user", "content": eval_context},
         ],
-        # temperature=0,  # Deterministic evaluation
-        # max_tokens=5000,
         response_format=EvalResult,
     )
 
     result = completion.choices[0].message.parsed
     if not result:
         raise ValueError("No evaluation result received")
-
     return result
-
-
-async def run_parallel(items: List[Any], task_func: Callable[..., T], *args) -> List[T]:
-    """Run tasks in parallel using asyncio"""
-
-    async def wrapped_task(item):
-        return await asyncio.to_thread(task_func, item, *args)
-
-    return await asyncio.gather(*(wrapped_task(item) for item in items))
 
 
 def main():
@@ -225,12 +181,12 @@ def main():
     pbar = tqdm(desc="Evals", total=len(drafts) * len(synthetic_input) * 2)
     prompt_results = []
     for draft in drafts:
-        prompt_data = {"prompt": draft, "tests": []}
+        prompt_data = {"prompt": draft, "id": uuid.uuid4().hex[:8],  "tests": []}
         for i, test_data in enumerate(synthetic_input):  # could parallelize
             output = test_prompt(draft, test_data, runtime_args)
             pbar.update()
             if output is None:
-                print(f"Warning: No output received for test {i}")
+                logger.warning(f"No output received for test {i}")
                 prompt_data["tests"].append(
                     {
                         "input": test_data,
@@ -254,7 +210,7 @@ def main():
                     }
                 )
             except ValueError as e:
-                print(f"Warning: Evaluation failed for test {i}: {str(e)}")
+                logger.warning(f"Evaluation failed for test {i}: {str(e)}")
                 prompt_data["tests"].append(
                     {
                         "input": test_data,
