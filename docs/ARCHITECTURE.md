@@ -2,64 +2,45 @@
 
 ## Overview
 
-Prompt Refiner is a Python-based system designed to generate, edit, test, and evaluate prompts for language models. The system uses OpenAI's GPT models to create and refine prompts through a multi-stage process.
+Prompt Refiner is a Python-based system that generates, tests, and evaluates prompts for language models through a modular architecture.
 
 ## System Components
 
-### Core Module (`refiner.py`)
+### Core Module (`refine.py`)
 
-The main module implementing the core functionality:
+Orchestrates the prompt refinement workflow:
+- Manages the overall process flow
+- Handles parallel processing of drafts and tests
+- Implements caching and persistence
 
-- **generate_prompt(task_or_prompt: str, temp=1)**: Creates new prompts based on tasks or existing prompts
-  - Uses different temperature settings to generate diverse options
-  - Returns refined prompt text
+### Synthesis Module (`synthesize.py`)
 
-- **edit_prompt(prompt: str, edit_statement: str)**: Modifies existing prompts
-  - Takes an existing prompt and edit instructions
-  - Returns updated prompt text
+Generates synthetic test data:
+- `get_user_prompts()`: Creates realistic user inputs for testing prompts
+- Uses structured output parsing with Pydantic models
 
-- **get_user_prompts(system_prompt: str) -> List[str]**: Generates synthetic test inputs
-  - Creates realistic user interactions for testing
-  - Returns a list of synthetic inputs
+### Evaluation Module (`evaluate.py`)
 
-- **test_prompt(system_prompt: str, user_prompt=None)**: Tests prompts with synthetic inputs
-  - Validates prompt effectiveness
-  - Returns model response for analysis
+Tests and evaluates prompt effectiveness:
+- `test_prompt()`: Executes prompts with test inputs
+- `evaluate_completion()`: Analyzes output quality
+- `process_test_input()`: Manages the test execution pipeline
 
 ### Prompt Templates (`prompts/`)
 
 Template files defining system behavior:
-
-- `generate.txt`: Instructions for prompt creation
-- `edit.txt`: Guidelines for prompt modification
-- `gen user prompt.txt`: Rules for synthetic input generation
-- `evaluate.txt`: Criteria for quality assessment
+- Generation templates
+- Evaluation criteria
+- Synthetic data generation rules
 
 ### Cache System (`cache/`)
 
-Storage for generated prompts:
-- JSON files with timestamps
-- Stores both original and refined drafts
-- Enables version comparison and tracking
+Storage for generated prompts and evaluation results
 
 ## Workflow
 
-1. **Input Processing**
-   ```
-   User Input (task/prompt) → generate_prompt() → Initial Drafts
-   ```
-
-2. **Multi-Temperature Generation**
-   ```
-   Initial Drafts → [temp=0, 0.6, 1.2] → Multiple Versions
-   ```
-
-3. **Refinement**
-   ```
-   Multiple Versions → generate_prompt() → Refined Drafts
-   ```
-
-4. **Storage**
-   ```
-   All Drafts → JSON → cache/draft_[timestamp].json
-   ```
+1. **Input Processing**: User prompt → Synthetic input generation
+2. **Draft Generation**: Multiple drafts with varying temperatures
+3. **Parallel Testing**: Each draft tested against synthetic inputs
+4. **Evaluation**: Quality metrics calculated for each draft
+5. **Storage**: Results cached for comparison and tracking

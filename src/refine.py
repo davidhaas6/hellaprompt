@@ -7,13 +7,13 @@ import os
 import sys
 from typing import Any, Callable, List
 import uuid
-from annotated_types import T
 from openai import OpenAI
 from tqdm import tqdm
-from pydantic import BaseModel
-import asyncio
 from jinja2 import Environment, FileSystemLoader
 import logging
+
+from evaluate import process_test_input
+from synthesize import get_user_prompts
 
 
 logger = logging.getLogger("hellaprompt")
@@ -25,33 +25,15 @@ logger.addHandler(handler)
 logger.propagate = False # Stop logger from propagating messages to the root logger
 
 client = OpenAI()
-
 jinja_env = Environment(loader=FileSystemLoader("../prompts"))
-
-
-class SyntheticInputData(BaseModel):
-    synthetic_inputs: List[str]
-
-
-class EvalResult(BaseModel):
-    output_analysis: str
-    reasoning: str
-    completeness: int
-    relevance: int
-    efficiency: int
-    creativity: int
 
 
 with open("../prompts/generate.txt") as f:
     GENERATE_PROMPT = f.read().strip()
 
-with open("../prompts/evaluate.txt") as f:
-    EVALUATE_PROMPT = f.read().strip()
-
-
 def generate_prompt(task_or_prompt: str, temp=1):
     completion = client.chat.completions.create(
-        model="gpt-4o-mini",
+        model="gpt-4o",
         messages=[
             {
                 "role": "system",
@@ -69,7 +51,7 @@ def generate_prompt(task_or_prompt: str, temp=1):
     return completion.choices[0].message.content
 
 
-def needs_input(prompt_to_analyze: str):
+def needs_input(prompt_to_analyze: str) -> bool:
     template = jinja_env.get_template("needs_inputs_clf.jinja")
     prompt = template.render(prompt=prompt_to_analyze)
     completion = client.chat.completions.create(
@@ -97,73 +79,16 @@ def needs_input(prompt_to_analyze: str):
     return True
 
 
-def get_user_prompts(system_prompt: str, num: int) -> List[str]:
-    template = jinja_env.get_template("synthetic_data.jinja")
-    prompt = template.render(prompt=system_prompt, num=num, complexity="Standard")
-
-    completion = client.beta.chat.completions.parse(
-        model="gpt-4o",
-        messages=[
-            {
-                "role": "system",
-                "content": prompt,
-            },
-        ],
-        temperature=0.3,
-        max_tokens=5000,
-        response_format=SyntheticInputData,
-    )
-
-    data = completion.choices[0].message.parsed
-
-    if data:
-        num_gen = len(data.synthetic_inputs)
-        if num_gen != num:
-            logger.warning(f"{num} inputs requested but {num_gen} generated.")
-        return data.synthetic_inputs
-    return []
-
-
-def test_prompt(system_prompt: str, user_prompt: str | None, args: dict):
-    messages = [
-        {"role": "system", "content": system_prompt, "name": None}
-    ]
-    if user_prompt:
-        # not all prompts need user input data
-        messages.append({"role": "user", "content": user_prompt, "name": None})
-    completion = client.chat.completions.create(
-        messages=messages,
-        **args
-    )
-    return completion.choices[0].message.content
-
-
-def evaluate_completion(system_prompt: str, user_prompt: str, output: str):
-    template = jinja_env.get_template("evaluate_user.jinja")
-    eval_context = template.render(
-        system_prompt=system_prompt, user_prompt=user_prompt, output=output
-    )
-    print(eval_context)
-    completion = client.beta.chat.completions.parse(
-        model="o3-mini",
-        messages=[
-            {"role": "system", "content": EVALUATE_PROMPT},
-            {"role": "user", "content": eval_context},
-        ],
-        response_format=EvalResult,
-    )
-
-    result = completion.choices[0].message.parsed
-    if not result:
-        raise ValueError("No evaluation result received")
-    return result
-
-
 def main():
     print("Enter your prompt. Type ctrl+d and enter to submit")
-    lines = sys.stdin.readlines()
-    sys.stdin.close()
-    prompt = "\n".join(lines)
+    try:
+        lines = sys.stdin.readlines()
+        sys.stdin.close()
+        prompt = "\n".join(lines)
+        logger.info("Submitted!")
+    except KeyboardInterrupt:
+        logger.info("Canceled!")
+        return
 
     if needs_input(prompt):
         logger.info("Generating synthetic inputs...")
@@ -185,40 +110,6 @@ def main():
         for future in tqdm(as_completed(futures), total=len(temps), desc="Drafting"):
             drafts.append(future.result())
 
-    def process_test_input(args):
-        draft, test_data, runtime_args = args
-        try:
-            output = test_prompt(draft, test_data, runtime_args)
-            if output is None:
-                logger.warning(f"No output received for test input: {test_data}")
-                return draft, {
-                    "input": test_data,
-                    "output": None,
-                    "evaluation": None,
-                }
-
-            try:
-                eval_result = evaluate_completion(draft, str(test_data), output)
-                return draft, {
-                    "input": test_data,
-                    "output": output,
-                    "evaluation": eval_result.model_dump(),
-                }
-            except ValueError as e:
-                logger.warning(f"Evaluation failed for test input {test_data}: {str(e)}")
-                return draft, {
-                    "input": test_data,
-                    "output": output,
-                    "evaluation": None,
-                }
-        except Exception as e:
-            logger.error(f"Error processing test input {test_data}: {str(e)}")
-            return draft, {
-                "input": test_data,
-                "output": None,
-                "evaluation": None,
-            }
-
     # Initialize results structure
     prompt_results = {
         draft: {"prompt": draft, "id": uuid.uuid4().hex[:8], "tests": []}
@@ -226,18 +117,18 @@ def main():
     }
 
     # Create test inputs
-    test_inputs = [
+    eval_input_data = [
         (draft, data, runtime_args)
         for draft in drafts
         for data in synthetic_input
     ]
 
     # Process test inputs in parallel
-    total_tasks = len(test_inputs)
+    total_tasks = len(eval_input_data)
     with ThreadPoolExecutor(max_workers=total_tasks) as executor:
         futures = [
             executor.submit(process_test_input, test_input)
-            for test_input in test_inputs
+            for test_input in eval_input_data
         ]
         
         with tqdm(total=total_tasks, desc="Processing tests") as pbar:
