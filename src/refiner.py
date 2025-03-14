@@ -15,7 +15,15 @@ import asyncio
 from jinja2 import Environment, FileSystemLoader
 import logging
 
-logger = logging.getLogger("refiner")
+
+logger = logging.getLogger("hellaprompt")
+logger.setLevel(logging.DEBUG)
+# Add a console handler
+handler = logging.StreamHandler()
+handler.setFormatter(logging.Formatter('%(asctime)s * %(levelname)s: %(message)s'))
+logger.addHandler(handler)
+logger.propagate = False # Stop logger from propagating messages to the root logger
+
 client = OpenAI()
 
 jinja_env = Environment(loader=FileSystemLoader("../prompts"))
@@ -118,24 +126,24 @@ def get_user_prompts(system_prompt: str, num: int) -> List[str]:
 
 def test_prompt(system_prompt: str, user_prompt: str | None, args: dict):
     messages = [
-        {
-            "role": "system",
-            "content": system_prompt,
-        }
+        {"role": "system", "content": system_prompt, "name": None}
     ]
     if user_prompt:
         # not all prompts need user input data
-        messages.append({"role": "user", "content": user_prompt})
-    completion = client.chat.completions.create(messages=messages, **args)
+        messages.append({"role": "user", "content": user_prompt, "name": None})
+    completion = client.chat.completions.create(
+        messages=messages,
+        **args
+    )
     return completion.choices[0].message.content
 
 
 def evaluate_completion(system_prompt: str, user_prompt: str, output: str):
-    # Template the evaluation prompt with actual data
     template = jinja_env.get_template("evaluate_user.jinja")
     eval_context = template.render(
         system_prompt=system_prompt, user_prompt=user_prompt, output=output
     )
+    print(eval_context)
     completion = client.beta.chat.completions.parse(
         model="o3-mini",
         messages=[
@@ -162,7 +170,6 @@ def main():
         synthetic_input = get_user_prompts(prompt, 5)
     else:
         synthetic_input = [None]
-    logger.info(synthetic_input)
 
     runtime_args = {
         "model": "gpt-4o-mini",
@@ -178,56 +185,76 @@ def main():
         for future in tqdm(as_completed(futures), total=len(temps), desc="Drafting"):
             drafts.append(future.result())
 
-    pbar = tqdm(desc="Evals", total=len(drafts) * len(synthetic_input) * 2)
-    prompt_results = []
-    for draft in drafts:
-        prompt_data = {"prompt": draft, "id": uuid.uuid4().hex[:8],  "tests": []}
-        for i, test_data in enumerate(synthetic_input):  # could parallelize
+    def process_test_input(args):
+        draft, test_data, runtime_args = args
+        try:
             output = test_prompt(draft, test_data, runtime_args)
-            pbar.update()
             if output is None:
-                logger.warning(f"No output received for test {i}")
-                prompt_data["tests"].append(
-                    {
-                        "input": test_data,
-                        "input_idx": i,
-                        "output": None,
-                        "evaluation": None,
-                    }
-                )
-                continue
+                logger.warning(f"No output received for test input: {test_data}")
+                return draft, {
+                    "input": test_data,
+                    "output": None,
+                    "evaluation": None,
+                }
 
-            # Evaluate the completion
             try:
                 eval_result = evaluate_completion(draft, str(test_data), output)
-                pbar.update()
-                prompt_data["tests"].append(
-                    {
-                        "input": test_data,
-                        "input_idx": i,
-                        "output": output,
-                        "evaluation": eval_result.model_dump(),
-                    }
-                )
+                return draft, {
+                    "input": test_data,
+                    "output": output,
+                    "evaluation": eval_result.model_dump(),
+                }
             except ValueError as e:
-                logger.warning(f"Evaluation failed for test {i}: {str(e)}")
-                prompt_data["tests"].append(
-                    {
-                        "input": test_data,
-                        "input_idx": i,
-                        "output": output,
-                        "evaluation": None,
-                    }
-                )
-        prompt_results.append(prompt_data)
-    pbar.close()
+                logger.warning(f"Evaluation failed for test input {test_data}: {str(e)}")
+                return draft, {
+                    "input": test_data,
+                    "output": output,
+                    "evaluation": None,
+                }
+        except Exception as e:
+            logger.error(f"Error processing test input {test_data}: {str(e)}")
+            return draft, {
+                "input": test_data,
+                "output": None,
+                "evaluation": None,
+            }
+
+    # Initialize results structure
+    prompt_results = {
+        draft: {"prompt": draft, "id": uuid.uuid4().hex[:8], "tests": []}
+        for draft in drafts
+    }
+
+    # Create test inputs
+    test_inputs = [
+        (draft, data, runtime_args)
+        for draft in drafts
+        for data in synthetic_input
+    ]
+
+    # Process test inputs in parallel
+    total_tasks = len(test_inputs)
+    with ThreadPoolExecutor(max_workers=total_tasks) as executor:
+        futures = [
+            executor.submit(process_test_input, test_input)
+            for test_input in test_inputs
+        ]
+        
+        with tqdm(total=total_tasks, desc="Processing tests") as pbar:
+            for future in as_completed(futures):
+                draft, result = future.result()
+                prompt_results[draft]["tests"].append(result)
+                pbar.update()
+
+    # Convert results to list format
+    prompt_results = list(prompt_results.values())
 
     os.makedirs("../cache/", exist_ok=True)
     timestamp = datetime.datetime.now().strftime("prompts_%d%m%Y_%H%M%S")
     filename = f"../cache/draft_{timestamp}.json"
     with open(filename, "w") as f:
         f.write(json.dumps(prompt_results, indent=2))
-    print(f"Saved prompts to {filename}")
+    logger.debug(f"Saved prompts to {filename}")
 
 
 if __name__ == "__main__":

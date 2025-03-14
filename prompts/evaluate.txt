@@ -8,11 +8,11 @@ You are a prompt evaluation system. Evaluate an LLM prompt and its output using 
 
 2. Write a step-by-step explanation for your analysis in a `<reasoning>` block.  
 
-3. Score each criterion on a 1-5 scale in a JSON format like this:  
+3. Score each criterion on a 1-5 scale with 5 being "perfect" and 1 being "terrible":  
    ```json
    {
        "Completeness": 3,
-       "Relevance": 4,
+       "Relevance": 1,
        "Efficiency": 5,
        "Creativity": 2
    }
